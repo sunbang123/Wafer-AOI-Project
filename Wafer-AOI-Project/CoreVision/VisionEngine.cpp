@@ -1,27 +1,78 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/dnn.hpp>
 #include <iostream>
+#include <mutex>
 
 using namespace cv;
 using namespace cv::dnn;
 
-// C#에서 이 함수를 꺼내 쓸 수 있도록 꼬리표(__declspec)를 붙여줍니다.
+namespace {
+    Net g_waferNet;
+    std::mutex g_modelMutex;
+
+    bool EnsureModelLoaded()
+    {
+        if (!g_waferNet.empty()) {
+            return true;
+        }
+
+        String modelPath = "wafer_defect_model.onnx";
+        g_waferNet = readNetFromONNX(modelPath);
+        g_waferNet.setPreferableBackend(DNN_BACKEND_OPENCV);
+        g_waferNet.setPreferableTarget(DNN_TARGET_CPU);
+
+        return !g_waferNet.empty();
+    }
+}
+
+// Exported for C# P/Invoke.
 extern "C" __declspec(dllexport) bool LoadWaferModel() {
-    // 우리가 C# bin/Debug 폴더로 복사되게 만든 모델 파일 이름
-    String modelPath = "wafer_defect_model.onnx";
+    try {
+        std::lock_guard<std::mutex> lock(g_modelMutex);
+        return EnsureModelLoaded();
+    }
+    catch (const cv::Exception&) {
+        return false;
+    }
+}
+
+// Returns the predicted defect class index for the image file path.
+extern "C" __declspec(dllexport) int PredictWaferDefect(const char* imagePath) {
+    if (imagePath == nullptr || imagePath[0] == '\0') {
+        return -1; // Empty image path.
+    }
 
     try {
-        // AI 모델 읽기 시도
-        Net net = readNetFromONNX(modelPath);
+        std::lock_guard<std::mutex> lock(g_modelMutex);
 
-        // CPU 모드로 세팅
-        net.setPreferableBackend(DNN_BACKEND_OPENCV);
-        net.setPreferableTarget(DNN_TARGET_CPU);
+        if (!EnsureModelLoaded()) {
+            return -2; // Model load failed.
+        }
 
-        return true; // 성공하면 true 반환
+        Mat image = imread(imagePath, IMREAD_COLOR);
+        if (image.empty()) {
+            return -3; // Image read failed.
+        }
+
+        Mat resized;
+        resize(image, resized, Size(64, 64));
+
+        Mat blob = blobFromImage(resized, 1.0 / 255.0, Size(64, 64), Scalar(), true, false);
+
+        g_waferNet.setInput(blob);
+        Mat output = g_waferNet.forward();
+
+        Mat scores = output.reshape(1, 1);
+        Point classIdPoint;
+        double confidence;
+        minMaxLoc(scores, nullptr, &confidence, nullptr, &classIdPoint);
+
+        return classIdPoint.x;
     }
-    catch (const cv::Exception& e) {
-        // 실패하면 에러 메시지는 나중에 C# 콘솔 등에서 확인할 수 있습니다.
-        return false; // 실패하면 false 반환
+    catch (const cv::Exception&) {
+        return -4; // OpenCV error.
+    }
+    catch (...) {
+        return -5; // Unknown error.
     }
 }
